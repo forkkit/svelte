@@ -1,9 +1,7 @@
-import MagicString, { Bundle } from 'magic-string';
-// @ts-ignore
 import { walk, childKeys } from 'estree-walker';
 import { getLocator } from 'locate-character';
 import Stats from '../Stats';
-import { globals, reserved } from '../utils/names';
+import { globals, reserved, is_valid } from '../utils/names';
 import { namespaces, valid_namespaces } from '../utils/namespaces';
 import create_module from './create_module';
 import {
@@ -16,20 +14,19 @@ import Stylesheet from './css/Stylesheet';
 import { test } from '../config';
 import Fragment from './nodes/Fragment';
 import internal_exports from './internal_exports';
-import { Node, Ast, CompileOptions, Var, Warning } from '../interfaces';
+import { Ast, CompileOptions, Var, Warning } from '../interfaces';
 import error from '../utils/error';
 import get_code_frame from '../utils/get_code_frame';
 import flatten_reference from './utils/flatten_reference';
 import is_reference from 'is-reference';
 import TemplateScope from './nodes/shared/TemplateScope';
 import fuzzymatch from '../utils/fuzzymatch';
-import { remove_indentation, add_indentation } from '../utils/indentation';
 import get_object from './utils/get_object';
-import unwrap_parens from './utils/unwrap_parens';
 import Slot from './nodes/Slot';
-import { Node as ESTreeNode } from 'estree';
+import { Node, ImportDeclaration, Identifier, Program, ExpressionStatement, AssignmentExpression, Literal } from 'estree';
 import add_to_set from './utils/add_to_set';
 import check_graph_for_cycles from './utils/check_graph_for_cycles';
+import { print, x } from 'code-red';
 
 interface ComponentOptions {
 	namespace?: string;
@@ -46,40 +43,6 @@ childKeys.EachBlock = childKeys.IfBlock = ['children', 'else'];
 childKeys.Attribute = ['value'];
 childKeys.ExportNamedDeclaration = ['declaration', 'specifiers'];
 
-function remove_node(
-	code: MagicString,
-	start: number,
-	end: number,
-	body: Node,
-	node: Node
-) {
-	const i = body.indexOf(node);
-	if (i === -1) throw new Error('node not in list');
-
-	let a;
-	let b;
-
-	if (body.length === 1) {
-		// remove everything, leave {}
-		a = start;
-		b = end;
-	} else if (i === 0) {
-		// remove everything before second node, including comments
-		a = start;
-		while (/\s/.test(code.original[a])) a += 1;
-
-		b = body[i].end;
-		while (/[\s,]/.test(code.original[b])) b += 1;
-	} else {
-		// remove the end of the previous node to the end of this one
-		a = body[i - 1].end;
-		b = node.end;
-	}
-
-	code.remove(a, b);
-	return;
-}
-
 export default class Component {
 	stats: Stats;
 	warnings: Warning[];
@@ -87,9 +50,9 @@ export default class Component {
 	ignore_stack: Array<Set<string>> = [];
 
 	ast: Ast;
+	original_ast: Ast;
 	source: string;
-	code: MagicString;
-	name: string;
+	name: Identifier;
 	compile_options: CompileOptions;
 	fragment: Fragment;
 	module_scope: Scope;
@@ -104,14 +67,12 @@ export default class Component {
 	vars: Var[] = [];
 	var_lookup: Map<string, Var> = new Map();
 
-	imports: Node[] = [];
-	module_javascript: string;
-	javascript: string;
+	imports: ImportDeclaration[] = [];
 
 	hoistable_nodes: Set<Node> = new Set();
 	node_for_declaration: Map<string, Node> = new Map();
-	partly_hoisted: string[] = [];
-	fully_hoisted: string[] = [];
+	partly_hoisted: Array<(Node | Node[])> = [];
+	fully_hoisted: Array<(Node | Node[])> = [];
 	reactive_declarations: Array<{
 		assignees: Set<string>;
 		dependencies: Set<string>;
@@ -121,26 +82,17 @@ export default class Component {
 	reactive_declaration_nodes: Set<Node> = new Set();
 	has_reactive_assignments = false;
 	injected_reactive_declaration_vars: Set<string> = new Set();
-	helpers: Map<string, string> = new Map();
-	globals: Map<string, string> = new Map();
+	helpers: Map<string, Identifier> = new Map();
+	globals: Map<string, Identifier> = new Map();
 
 	indirect_dependencies: Map<string, Set<string>> = new Map();
 
 	file: string;
 	locate: (c: number) => { line: number; column: number };
 
-	// TODO this does the same as component.locate! remove one or the other
-	locator: (
-		search: number,
-		startIndex?: number
-	) => {
-		line: number;
-		column: number;
-	};
-
 	stylesheet: Stylesheet;
 
-	aliases: Map<string, string> = new Map();
+	aliases: Map<string, Identifier> = new Map();
 	used_names: Set<string> = new Set();
 	globally_used_names: Set<string> = new Set();
 
@@ -155,13 +107,22 @@ export default class Component {
 		stats: Stats,
 		warnings: Warning[]
 	) {
-		this.name = name;
+		this.name = { type: 'Identifier', name };
 
 		this.stats = stats;
 		this.warnings = warnings;
 		this.ast = ast;
 		this.source = source;
 		this.compile_options = compile_options;
+
+		// the instance JS gets mutated, so we park
+		// a copy here for later. TODO this feels gross
+		this.original_ast = {
+			html: ast.html,
+			css: ast.css,
+			instance: ast.instance && JSON.parse(JSON.stringify(ast.instance)),
+			module: ast.module
+		};
 
 		this.file =
 			compile_options.filename &&
@@ -170,9 +131,7 @@ export default class Component {
 					.replace(process.cwd(), '')
 					.replace(/^[/\\]/, '')
 				: compile_options.filename);
-		this.locate = getLocator(this.source);
-
-		this.code = new MagicString(source);
+		this.locate = getLocator(this.source, { offsetLine: 1 });
 
 		// styles
 		this.stylesheet = new Stylesheet(
@@ -206,7 +165,7 @@ export default class Component {
 			}
 			this.tag = this.component_options.tag || compile_options.tag;
 		} else {
-			this.tag = this.name;
+			this.tag = this.name.name;
 		}
 
 		this.walk_module_js();
@@ -257,15 +216,6 @@ export default class Component {
 		}
 	}
 
-	add_sourcemap_locations(node: Node) {
-		walk(node, {
-			enter: (node: Node) => {
-				this.code.addSourcemapLocation(node.start);
-				this.code.addSourcemapLocation(node.end);
-			},
-		});
-	}
-
 	alias(name: string) {
 		if (!this.aliases.has(name)) {
 			this.aliases.set(name, this.get_unique_name(name));
@@ -274,19 +224,13 @@ export default class Component {
 		return this.aliases.get(name);
 	}
 
-	helper(name: string) {
-		const alias = this.alias(name);
-		this.helpers.set(name, alias);
-		return alias;
-	}
-
 	global(name: string) {
 		const alias = this.alias(name);
 		this.globals.set(name, alias);
 		return alias;
 	}
 
-	generate(result: string) {
+	generate(result?: Node[]) {
 		let js = null;
 		let css = null;
 
@@ -294,55 +238,66 @@ export default class Component {
 			const { compile_options, name } = this;
 			const { format = 'esm' } = compile_options;
 
-			const banner = `/* ${
-				this.file ? `${this.file} ` : ``
-			}generated by Svelte v${'__VERSION__'} */`;
+			// TODO reinstate banner (along with fragment marker comments)
+			const banner = `/* ${this.file ? `${this.file} ` : ``}generated by Svelte v${'__VERSION__'} */`;
 
-			result = result
-				.replace(/__svelte:self__/g, this.name)
-				.replace(
-					compile_options.generate === 'ssr'
-						? /(@+|#+)(\w*(?:-\w*)?)/g
-						: /(@+)(\w*(?:-\w*)?)/g,
-					(_match: string, sigil: string, name: string) => {
-						if (sigil === '@') {
-							if (name[0] === '_') {
-								return this.global(name.slice(1));
+			const program: any = { type: 'Program', body: result };
+
+			walk(program, {
+				enter: (node, parent, key) => {
+					if (node.type === 'Identifier') {
+						if (node.name[0] === '@') {
+							if (node.name[1] === '_') {
+								const alias = this.global(node.name.slice(2));
+								node.name = alias.name;
+							} else {
+								let name = node.name.slice(1);
+
+								if (compile_options.dev) {
+									if (internal_exports.has(`${name}_dev`)) {
+										name += '_dev';
+									} else if (internal_exports.has(`${name}Dev`)) {
+										name += 'Dev';
+									}
+								}
+
+								const alias = this.alias(name);
+								this.helpers.set(name, alias);
+								node.name = alias.name;
 							}
-
-							if (!internal_exports.has(name)) {
-								throw new Error(
-									`compiler error: this shouldn't happen! generated code is trying to use inexistent internal '${name}'`
-								);
-							}
-
-							if (compile_options.dev) {
-								if (internal_exports.has(`${name}_dev`)) name = `${name}_dev`;
-								else if (internal_exports.has(`${name}Dev`))
-									name = `${name}Dev`;
-							}
-
-							return this.helper(name);
 						}
 
-						return sigil.slice(1) + name;
+						else if (node.name[0] !== '#' && !is_valid(node.name)) {
+							// this hack allows x`foo.${bar}` where bar could be invalid
+							const literal: Literal = { type: 'Literal', value: node.name };
+
+							if (parent.type === 'Property' && key === 'key') {
+								parent.key = literal;
+							}
+
+							else if (parent.type === 'MemberExpression' && key === 'property') {
+								parent.property = literal;
+								parent.computed = true;
+							}
+						}
 					}
-				);
+				}
+			});
 
 			const referenced_globals = Array.from(
 				this.globals,
-				([name, alias]) => name !== alias && { name, alias }
+				([name, alias]) => name !== alias.name && { name, alias }
 			).filter(Boolean);
 			if (referenced_globals.length) {
-				this.helper('globals');
+				this.helpers.set('globals', this.alias('globals'));
 			}
 			const imported_helpers = Array.from(this.helpers, ([name, alias]) => ({
 				name,
 				alias,
 			}));
 
-			const module = create_module(
-				result,
+			create_module(
+				program,
 				format,
 				name,
 				banner,
@@ -355,67 +310,30 @@ export default class Component {
 					.map(variable => ({
 						name: variable.name,
 						as: variable.export_name,
-					})),
-				this.source
+					}))
 			);
-
-			const parts = module.split('✂]');
-			const final_chunk = parts.pop();
-
-			const compiled = new Bundle({ separator: '' });
-
-			function add_string(str: string) {
-				compiled.addSource({
-					content: new MagicString(str),
-				});
-			}
-
-			const { filename } = compile_options;
-
-			// special case — the source file doesn't actually get used anywhere. we need
-			// to add an empty file to populate map.sources and map.sourcesContent
-			if (!parts.length) {
-				compiled.addSource({
-					filename,
-					content: new MagicString(this.source).remove(0, this.source.length),
-				});
-			}
-
-			const pattern = /\[✂(\d+)-(\d+)$/;
-
-			parts.forEach((str: string) => {
-				const chunk = str.replace(pattern, '');
-				if (chunk) add_string(chunk);
-
-				const match = pattern.exec(str);
-
-				const snippet = this.code.snip(+match[1], +match[2]);
-
-				compiled.addSource({
-					filename,
-					content: snippet,
-				});
-			});
-
-			add_string(final_chunk);
 
 			css = compile_options.customElement
 				? { code: null, map: null }
 				: this.stylesheet.render(compile_options.cssOutputFilename, true);
 
-			js = {
-				code: compiled.toString(),
-				map: compiled.generateMap({
-					includeContent: true,
-					file: compile_options.outputFilename,
-				}),
-			};
+			js = print(program, {
+				sourceMapSource: compile_options.filename
+			});
+
+			js.map.sources = [
+				compile_options.filename ? get_relative_path(compile_options.outputFilename || '', compile_options.filename) : null
+			];
+
+			js.map.sourcesContent = [
+				this.source
+			];
 		}
 
 		return {
 			js,
 			css,
-			ast: this.ast,
+			ast: this.original_ast,
 			warnings: this.warnings,
 			vars: this.vars
 				.filter(v => !v.global && !v.internal)
@@ -433,7 +351,7 @@ export default class Component {
 		};
 	}
 
-	get_unique_name(name: string) {
+	get_unique_name(name: string): Identifier {
 		if (test) name = `${name}$`;
 		let alias = name;
 		for (
@@ -445,7 +363,7 @@ export default class Component {
 			alias = `${name}_${i++}`
 		);
 		this.used_names.add(alias);
-		return alias;
+		return { type: 'Identifier', name: alias };
 	}
 
 	get_unique_name_maker() {
@@ -459,7 +377,7 @@ export default class Component {
 		internal_exports.forEach(add);
 		this.var_lookup.forEach((_value, key) => add(key));
 
-		return (name: string) => {
+		return (name: string): Identifier => {
 			if (test) name = `${name}$`;
 			let alias = name;
 			for (
@@ -469,7 +387,11 @@ export default class Component {
 			);
 			local_used_names.add(alias);
 			this.globally_used_names.add(alias);
-			return alias;
+
+			return {
+				type: 'Identifier',
+				name: alias
+			};
 		};
 	}
 
@@ -507,12 +429,8 @@ export default class Component {
 			return;
 		}
 
-		if (!this.locator) {
-			this.locator = getLocator(this.source, { offsetLine: 1 });
-		}
-
-		const start = this.locator(pos.start);
-		const end = this.locator(pos.end);
+		const start = this.locate(pos.start);
+		const end = this.locate(pos.end);
 
 		const frame = get_code_frame(this.source, start.line - 1, start.column);
 
@@ -525,26 +443,26 @@ export default class Component {
 			pos: pos.start,
 			filename: this.compile_options.filename,
 			toString: () =>
-				`${warning.message} (${start.line + 1}:${start.column})\n${frame}`,
+				`${warning.message} (${start.line}:${start.column})\n${frame}`,
 		});
 	}
 
 	extract_imports(content) {
-		const { code } = this;
+		for (let i = 0; i < content.body.length; i += 1) {
+			const node = content.body[i];
 
-		content.body.forEach(node => {
 			if (node.type === 'ImportDeclaration') {
-				// imports need to be hoisted out of the IIFE
-				remove_node(code, content.start, content.end, content.body, node);
+				content.body.splice(i--, 1);
 				this.imports.push(node);
 			}
-		});
+		}
 	}
 
 	extract_exports(content) {
-		const { code } = this;
+		let i = content.body.length;
+		while (i--) {
+			const node = content.body[i];
 
-		content.body.forEach(node => {
 			if (node.type === 'ExportDefaultDeclaration') {
 				this.error(node, {
 					code: `default-export`,
@@ -574,25 +492,27 @@ export default class Component {
 						variable.export_name = name;
 					}
 
-					code.remove(node.start, node.declaration.start);
+					content.body[i] = node.declaration;
 				} else {
-					remove_node(code, content.start, content.end, content.body, node);
 					node.specifiers.forEach(specifier => {
 						const variable = this.var_lookup.get(specifier.local.name);
 
 						if (variable) {
 							variable.export_name = specifier.exported.name;
-						} else {
-							// TODO what happens with `export { Math }` or some other global?
 						}
 					});
+
+					content.body.splice(i, 1);
 				}
 			}
-		});
+		}
 	}
 
 	extract_javascript(script) {
-		const nodes_to_include = script.content.body.filter(node => {
+		if (!script) return null;
+
+		return script.content.body.filter(node => {
+			if (!node) return false;
 			if (this.hoistable_nodes.has(node)) return false;
 			if (this.reactive_declaration_nodes.has(node)) return false;
 			if (node.type === 'ImportDeclaration') return false;
@@ -600,36 +520,6 @@ export default class Component {
 				return false;
 			return true;
 		});
-
-		if (nodes_to_include.length === 0) return null;
-
-		let a = script.content.start;
-		while (/\s/.test(this.source[a])) a += 1;
-
-		let b = a;
-
-		let result = '';
-
-		script.content.body.forEach(node => {
-			if (
-				this.hoistable_nodes.has(node) ||
-				this.reactive_declaration_nodes.has(node)
-			) {
-				if (a !== b) result += `[✂${a}-${b}✂]`;
-				a = node.end;
-			}
-
-			b = node.end;
-		});
-
-		// while (/\s/.test(this.source[a - 1])) a -= 1;
-
-		b = script.content.end;
-		while (/\s/.test(this.source[b - 1])) b -= 1;
-
-		if (a < b) result += `[✂${a}-${b}✂]`;
-
-		return result || null;
 	}
 
 	walk_module_js() {
@@ -640,7 +530,7 @@ export default class Component {
 		walk(script.content, {
 			enter(node) {
 				if (node.type === 'LabeledStatement' && node.label.name === '$') {
-					component.warn(node, {
+					component.warn(node as any, {
 						code: 'module-script-reactive-declaration',
 						message: '$: has no effect in a module script',
 					});
@@ -648,30 +538,30 @@ export default class Component {
 			},
 		});
 
-		this.add_sourcemap_locations(script.content);
-
 		const { scope, globals } = create_scopes(script.content);
 		this.module_scope = scope;
 
 		scope.declarations.forEach((node, name) => {
 			if (name[0] === '$') {
-				this.error(node, {
+				this.error(node as any, {
 					code: 'illegal-declaration',
 					message: `The $ prefix is reserved, and cannot be used for variable and import names`,
 				});
 			}
 
+			const writable = node.type === 'VariableDeclaration' && (node.kind === 'var' || node.kind === 'let');
+
 			this.add_var({
 				name,
 				module: true,
 				hoistable: true,
-				writable: node.kind === 'var' || node.kind === 'let',
+				writable
 			});
 		});
 
 		globals.forEach((node, name) => {
 			if (name[0] === '$') {
-				this.error(node, {
+				this.error(node as any, {
 					code: 'illegal-subscription',
 					message: `Cannot reference store value inside <script context="module">`,
 				});
@@ -679,28 +569,25 @@ export default class Component {
 				this.add_var({
 					name,
 					global: true,
+					hoistable: true
 				});
 			}
 		});
 
 		this.extract_imports(script.content);
 		this.extract_exports(script.content);
-		remove_indentation(this.code, script.content);
-		this.module_javascript = this.extract_javascript(script);
 	}
 
 	walk_instance_js_pre_template() {
 		const script = this.ast.instance;
 		if (!script) return;
 
-		this.add_sourcemap_locations(script.content);
-
 		// inject vars for reactive declarations
 		script.content.body.forEach(node => {
 			if (node.type !== 'LabeledStatement') return;
 			if (node.body.type !== 'ExpressionStatement') return;
 
-			const expression = unwrap_parens(node.body.expression);
+			const { expression } = node.body;
 			if (expression.type !== 'AssignmentExpression') return;
 
 			extract_names(expression.left).forEach(name => {
@@ -718,17 +605,19 @@ export default class Component {
 
 		instance_scope.declarations.forEach((node, name) => {
 			if (name[0] === '$') {
-				this.error(node, {
+				this.error(node as any, {
 					code: 'illegal-declaration',
 					message: `The $ prefix is reserved, and cannot be used for variable and import names`,
 				});
 			}
 
+			const writable = node.type === 'VariableDeclaration' && (node.kind === 'var' || node.kind === 'let');
+
 			this.add_var({
 				name,
 				initialised: instance_scope.initialised_declarations.has(name),
 				hoistable: /^Import/.test(node.type),
-				writable: node.kind === 'var' || node.kind === 'let',
+				writable
 			});
 
 			this.node_for_declaration.set(name, node);
@@ -752,7 +641,7 @@ export default class Component {
 				});
 			} else if (name[0] === '$') {
 				if (name === '$' || name[1] === '$') {
-					this.error(node, {
+					this.error(node as any, {
 						code: 'illegal-global',
 						message: `${name} is an illegal variable name`
 					});
@@ -773,6 +662,7 @@ export default class Component {
 				this.add_var({
 					name,
 					global: true,
+					hoistable: true
 				});
 			}
 		});
@@ -786,10 +676,9 @@ export default class Component {
 		const script = this.ast.instance;
 		if (!script) return;
 
+		this.warn_on_undefined_store_value_references();
 		this.hoist_instance_declarations();
 		this.extract_reactive_declarations();
-		this.extract_reactive_store_references();
-		this.javascript = this.extract_javascript(script);
 	}
 
 	// TODO merge this with other walks that are independent
@@ -805,20 +694,12 @@ export default class Component {
 					scope = map.get(node);
 				}
 
-				let names;
-				let deep = false;
+				if (node.type === 'AssignmentExpression' || node.type === 'UpdateExpression') {
+					const assignee = node.type === 'AssignmentExpression' ? node.left : node.argument;
+					const names = extract_names(assignee);
 
-				if (node.type === 'AssignmentExpression') {
-					deep = node.left.type === 'MemberExpression';
+					const deep = assignee.type === 'MemberExpression';
 
-					names = deep
-						? [get_object(node.left).name]
-						: extract_names(node.left);
-				} else if (node.type === 'UpdateExpression') {
-					names = [get_object(node.argument).name];
-				}
-
-				if (names) {
 					names.forEach(name => {
 						if (scope.find_owner(name) === instance_scope) {
 							const variable = component.var_lookup.get(name);
@@ -836,7 +717,7 @@ export default class Component {
 		});
 	}
 
-	extract_reactive_store_references() {
+	warn_on_undefined_store_value_references() {
 		// TODO this pattern happens a lot... can we abstract it
 		// (or better still, do fewer AST walks)?
 		const component = this;
@@ -853,13 +734,13 @@ export default class Component {
 					node.label.name === '$' &&
 					parent.type !== 'Program'
 				) {
-					component.warn(node, {
+					component.warn(node as any, {
 						code: 'non-top-level-reactive-declaration',
 						message: '$: has no effect outside of the top-level',
 					});
 				}
 
-				if (is_reference(node as ESTreeNode, parent as ESTreeNode)) {
+				if (is_reference(node as Node, parent as Node)) {
 					const object = get_object(node);
 					const { name } = object;
 
@@ -880,12 +761,12 @@ export default class Component {
 	invalidate(name, value?) {
 		const variable = this.var_lookup.get(name);
 
-		if (variable && (variable.subscribable && variable.reassigned)) {
-			return `$$subscribe_${name}($$invalidate('${name}', ${value || name}))`;
+		if (variable && (variable.subscribable && (variable.reassigned || variable.export_name))) {
+			return x`${`$$subscribe_${name}`}($$invalidate('${name}', ${value || name}))`;
 		}
 
 		if (name[0] === '$' && name[1] !== '$') {
-			return `${name.slice(1)}.set(${name})`;
+			return x`${name.slice(1)}.set(${value || name})`;
 		}
 
 		if (
@@ -899,7 +780,7 @@ export default class Component {
 		}
 
 		if (value) {
-			return `$$invalidate('${name}', ${value})`;
+			return x`$$invalidate('${name}', ${value})`;
 		}
 
 		// if this is a reactive declaration, invalidate dependencies recursively
@@ -917,22 +798,20 @@ export default class Component {
 		});
 
 		return Array.from(deps)
-			.map(n => `$$invalidate('${n}', ${n})`)
-			.join(', ');
+			.map(n => x`$$invalidate('${n}', ${n})`)
+			.reduce((lhs, rhs) => x`${lhs}, ${rhs}}`);
 	}
 
-	rewrite_props(get_insert: (variable: Var) => string) {
+	rewrite_props(get_insert: (variable: Var) => Node[]) {
+		if (!this.ast.instance) return;
+
 		const component = this;
-		const { code, instance_scope, instance_scope_map: map } = this;
+		const { instance_scope, instance_scope_map: map } = this;
 		let scope = instance_scope;
 
-		const coalesced_declarations = [];
-		let current_group;
-
 		walk(this.ast.instance.content, {
-			enter(node, parent) {
+			enter(node, parent, key, index) {
 				if (/Function/.test(node.type)) {
-					current_group = null;
 					return this.skip();
 				}
 
@@ -942,9 +821,7 @@ export default class Component {
 
 				if (node.type === 'VariableDeclaration') {
 					if (node.kind === 'var' || scope === instance_scope) {
-						node.declarations.forEach((declarator, i) => {
-							const next = node.declarations[i + 1];
-
+						node.declarations.forEach(declarator => {
 							if (declarator.id.type !== 'Identifier') {
 								const inserts = [];
 
@@ -952,7 +829,8 @@ export default class Component {
 									const variable = component.var_lookup.get(name);
 
 									if (variable.export_name) {
-										component.error(declarator, {
+										// TODO is this still true post-#3539?
+										component.error(declarator as any, {
 											code: 'destructured-prop',
 											message: `Cannot declare props in destructured declaration`,
 										});
@@ -963,16 +841,8 @@ export default class Component {
 									}
 								});
 
-								if (inserts.length > 0) {
-									if (next) {
-										code.overwrite(
-											declarator.end,
-											next.start,
-											`; ${inserts.join('; ')}; ${node.kind} `
-										);
-									} else {
-										code.appendLeft(declarator.end, `; ${inserts.join('; ')}`);
-									}
+								if (inserts.length) {
+									parent[key].splice(index + 1, 0, ...inserts);
 								}
 
 								return;
@@ -981,113 +851,51 @@ export default class Component {
 							const { name } = declarator.id;
 							const variable = component.var_lookup.get(name);
 
-							if (variable.export_name) {
-								if (current_group && current_group.kind !== node.kind) {
-									current_group = null;
-								}
-
+							if (variable.export_name && variable.writable) {
 								const insert = variable.subscribable
 									? get_insert(variable)
 									: null;
 
-								if (!current_group || (current_group.insert && insert)) {
-									current_group = {
-										kind: node.kind,
-										declarators: [declarator],
-										insert,
-									};
-									coalesced_declarations.push(current_group);
-								} else if (insert) {
-									current_group.insert = insert;
-									current_group.declarators.push(declarator);
-								} else {
-									current_group.declarators.push(declarator);
-								}
+								parent[key].splice(index + 1, 0, insert);
 
-								if (
-									variable.writable &&
-									variable.name !== variable.export_name
-								) {
-									code.prependRight(
-										declarator.id.start,
-										`${variable.export_name}: `
-									);
-								}
+								declarator.id = {
+									type: 'ObjectPattern',
+									properties: [{
+										type: 'Property',
+										method: false,
+										shorthand: false,
+										computed: false,
+										kind: 'init',
+										key: { type: 'Identifier', name: variable.export_name },
+										value: declarator.init
+											? {
+												type: 'AssignmentPattern',
+												left: declarator.id,
+												right: declarator.init
+											}
+											: declarator.id
+									}]
+								};
 
-								if (next) {
-									const next_variable = component.var_lookup.get(next.id.name);
-									const new_declaration =
-										!next_variable.export_name ||
-										(current_group.insert && next_variable.subscribable);
-
-									if (new_declaration) {
-										code.overwrite(
-											declarator.end,
-											next.start,
-											` ${node.kind} `
-										);
-									}
-								}
-							} else {
-								current_group = null;
-
-								if (variable.subscribable) {
-									const insert = get_insert(variable);
-
-									if (next) {
-										code.overwrite(
-											declarator.end,
-											next.start,
-											`; ${insert}; ${node.kind} `
-										);
-									} else {
-										code.appendLeft(declarator.end, `; ${insert}`);
-									}
-								}
+								declarator.init = x`$$props`;
+							} else if (variable.subscribable) {
+								const insert = get_insert(variable);
+								parent[key].splice(index + 1, 0, ...insert);
 							}
 						});
 					}
-				} else {
-					if (node.type !== 'ExportNamedDeclaration') {
-						if (!parent || parent.type === 'Program') current_group = null;
-					}
 				}
 			},
 
-			leave(node) {
+			leave(node, parent, _key, index) {
 				if (map.has(node)) {
 					scope = scope.parent;
 				}
-			},
-		});
 
-		coalesced_declarations.forEach(group => {
-			const writable = group.kind === 'var' || group.kind === 'let';
-
-			let c = 0;
-			let combining = false;
-
-			group.declarators.forEach(declarator => {
-				const { id } = declarator;
-
-				if (combining) {
-					code.overwrite(c, id.start, ', ');
-				} else {
-					if (writable) code.appendLeft(id.start, '{ ');
-					combining = true;
+				if (node.type === 'ExportNamedDeclaration' && node.declaration) {
+					(parent as Program).body[index] = node.declaration;
 				}
-
-				c = declarator.end;
-			});
-
-			if (combining) {
-				const insert = group.insert ? `; ${group.insert}` : '';
-
-				const suffix =
-					`${writable ? ` } = $$props` : ``}${insert}` +
-					(code.original[c] === ';' ? `` : `;`);
-				code.appendLeft(c, suffix);
-			}
+			},
 		});
 	}
 
@@ -1105,20 +913,26 @@ export default class Component {
 
 		const top_level_function_declarations = new Map();
 
-		this.ast.instance.content.body.forEach(node => {
+		const { body } = this.ast.instance.content;
+
+		for (let i = 0; i < body.length; i += 1) {
+			const node = body[i];
+
 			if (node.type === 'VariableDeclaration') {
 				const all_hoistable = node.declarations.every(d => {
 					if (!d.init) return false;
 					if (d.init.type !== 'Literal') return false;
 
-					const v = this.var_lookup.get(d.id.name);
+					const { name } = d.id as Identifier;
+
+					const v = this.var_lookup.get(name);
 					if (v.reassigned) return false;
 					if (v.export_name) return false;
 
-					if (this.var_lookup.get(d.id.name).reassigned) return false;
+					if (this.var_lookup.get(name).reassigned) return false;
 					if (
 						this.vars.find(
-							variable => variable.name === d.id.name && variable.module
+							variable => variable.name === name && variable.module
 						)
 					)
 						return false;
@@ -1128,12 +942,14 @@ export default class Component {
 
 				if (all_hoistable) {
 					node.declarations.forEach(d => {
-						const variable = this.var_lookup.get(d.id.name);
+						const variable = this.var_lookup.get((d.id as Identifier).name);
 						variable.hoistable = true;
 					});
 
 					hoistable_nodes.add(node);
-					this.fully_hoisted.push(`[✂${node.start}-${node.end}✂]`);
+
+					body.splice(i--, 1);
+					this.fully_hoisted.push(node);
 				}
 			}
 
@@ -1148,7 +964,7 @@ export default class Component {
 			if (node.type === 'FunctionDeclaration') {
 				top_level_function_declarations.set(node.id.name, node);
 			}
-		});
+		}
 
 		const checked = new Set();
 		const walking = new Set();
@@ -1175,7 +991,7 @@ export default class Component {
 						scope = map.get(node);
 					}
 
-					if (is_reference(node as ESTreeNode, parent as ESTreeNode)) {
+					if (is_reference(node as Node, parent as Node)) {
 						const { name } = flatten_reference(node);
 						const owner = scope.find_owner(name);
 
@@ -1235,9 +1051,9 @@ export default class Component {
 				variable.hoistable = true;
 				hoistable_nodes.add(node);
 
-				remove_indentation(this.code, node);
-
-				this.fully_hoisted.push(`[✂${node.start}-${node.end}✂]`);
+				const i = body.indexOf(node);
+				body.splice(i, 1);
+				this.fully_hoisted.push(node);
 			}
 		}
 	}
@@ -1265,14 +1081,20 @@ export default class Component {
 						}
 
 						if (node.type === 'AssignmentExpression') {
-							extract_identifiers(get_object(node.left)).forEach(node => {
+							const left = get_object(node.left);
+
+							extract_identifiers(left).forEach(node => {
 								assignee_nodes.add(node);
 								assignees.add(node.name);
 							});
+
+							if (node.operator !== '=') {
+								dependencies.add(left.name);
+							}
 						} else if (node.type === 'UpdateExpression') {
 							const identifier = get_object(node.argument);
 							assignees.add(identifier.name);
-						} else if (is_reference(node as ESTreeNode, parent as ESTreeNode)) {
+						} else if (is_reference(node as Node, parent as Node)) {
 							const identifier = get_object(node);
 							if (!assignee_nodes.has(identifier)) {
 								const { name } = identifier;
@@ -1300,11 +1122,8 @@ export default class Component {
 					},
 				});
 
-				add_indentation(this.code, node.body, 2);
-
-				const expression =
-					node.body.expression && unwrap_parens(node.body.expression);
-				const declaration = expression && expression.left;
+				const { expression } = node.body as ExpressionStatement;
+				const declaration = expression && (expression as AssignmentExpression).left;
 
 				unsorted_reactive_declarations.push({
 					assignees,
@@ -1376,17 +1195,22 @@ export default class Component {
 	}
 
 	qualify(name) {
-		if (name === `$$props`) return `ctx.$$props`;
+		if (name === `$$props`) return x`#ctx.$$props`;
 
-		const variable = this.var_lookup.get(name);
+		let [head, ...tail] = name.split('.');
 
-		if (!variable) return name;
+		const variable = this.var_lookup.get(head);
 
-		this.add_reference(name); // TODO we can probably remove most other occurrences of this
+		if (variable) {
+			this.add_reference(name); // TODO we can probably remove most other occurrences of this
 
-		if (variable.hoistable) return name;
+			if (!variable.hoistable) {
+				tail.unshift(head);
+				head = '#ctx';
+			}
+		}
 
-		return `ctx.${name}`;
+		return [head, ...tail].reduce((lhs, rhs) => x`${lhs}.${rhs}`);
 	}
 
 	warn_if_undefined(name: string, node, template_scope: TemplateScope) {
@@ -1544,4 +1368,23 @@ function process_component_options(component: Component, nodes) {
 	}
 
 	return component_options;
+}
+
+function get_relative_path(from: string, to: string) {
+	const from_parts = from.split(/[/\\]/);
+	const to_parts = to.split(/[/\\]/);
+
+	from_parts.pop(); // get dirname
+
+	while (from_parts[0] === to_parts[0]) {
+		from_parts.shift();
+		to_parts.shift();
+	}
+
+	if (from_parts.length) {
+		let i = from_parts.length;
+		while (i--) from_parts[i] = '..';
+	}
+
+	return from_parts.concat(to_parts).join('/');
 }
